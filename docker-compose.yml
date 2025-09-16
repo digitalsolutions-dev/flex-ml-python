@@ -1,0 +1,46 @@
+version: "3.9"
+
+services:
+  api:
+    image: python:3.11
+    working_dir: /app
+    environment:
+      PYTHONPATH: /app
+    command: >
+      bash -lc "pip install -r /app/requirements.txt &&
+                pip install -e /app/flexml &&
+                uvicorn app.main:app --host ${API_HOST:-0.0.0.0} --port ${API_PORT:-8000}"
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      # Mount the whole backend (which contains 'app/' folder) at /app
+      - ./api:/app
+      - ./requirements.txt:/app/requirements.txt
+      - ./flexml:/app/flexml
+      - ./sql:/app/sql
+    depends_on:
+      - redis
+
+  worker:
+    image: python:3.11
+    working_dir: /app
+    environment:
+      PYTHONPATH: /app
+    command: >
+      bash -lc "pip install -r /app/requirements.txt &&
+                pip install -e /app/flexml &&
+                python -c 'import app.celery_app as m; print(\"[import-ok]\", m)' &&
+                celery -A app.celery_app:celery worker --loglevel=INFO --concurrency=${CELERY_CONCURRENCY:-2}"
+    env_file: .env
+    volumes:
+      - ./api:/app
+      - ./requirements.txt:/app/requirements.txt
+      - ./flexml:/app/flexml
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"

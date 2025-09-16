@@ -1,0 +1,85 @@
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+env/
+venv/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Logs
+*.log
+celerybeat-schedule
+celerybeat.pid
+
+# Cache
+.cache/
+.mypy_cache/
+.pytest_cache/
+coverage/
+*.cover
+*.coverage
+
+# ==============================
+# AutoGluon / ML
+# ==============================
+# AutoGluon predictor save dirs (you can keep the dir name if you want to commit it)
+autogluon_timeseries_predictor/
+autogluon_models/
+
+# Large model files or fine-tuning artifacts
+*.pt
+*.ckpt
+*.h5
+*.onnx
+*.pkl
+*.joblib
+
+# ==============================
+# Jupyter
+# ==============================
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+*.nbconvert.ipynb
+
+# Output files from notebooks
+output/
+outputs/
+
+# ==============================
+# Temporary
+# ==============================
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Local configuration
+.env
+.env.*
+*.local
+config.local.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ==============================
+# Optional: ignore uploaded CSVs for tests
+# ==============================
+*.csv
+*.xlsx
+*.parquet
+*.json

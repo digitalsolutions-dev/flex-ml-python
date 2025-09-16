@@ -1,0 +1,6 @@
+customer_id,age,income,loan_amount,loan_term,employment_status,credit_score
+P101,33,5200,15000,36,Employed,640
+P102,48,8700,28000,60,Self-Employed,725
+P103,29,3900,12000,24,Unemployed,585
+P104,45,7900,22000,48,Employed,700
+P105,51,9800,31000,72,Employed,735

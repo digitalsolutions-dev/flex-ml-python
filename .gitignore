@@ -81,11 +81,3 @@ config.local.json
 # OS
 .DS_Store
 Thumbs.db
-
-# ==============================
-# Optional: ignore uploaded CSVs for tests
-# ==============================
-*.csv
-*.xlsx
-*.parquet
-*.json

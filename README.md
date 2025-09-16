@@ -2,6 +2,8 @@
 
 FastAPI + Celery + Redis, Polars/DuckDB I/O, S3 presigned uploads, MariaDB metadata, and Azure OpenAI tool-calling.
 
+Python version: 3.9
+
 ## Run
 ```bash
 cp .env.example .env

@@ -23,7 +23,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 import numpy as np
 import pandas as pd
 from pandas.tseries.frequencies import to_offset
-from pandas.tseries.holiday import AbstractHolidayCalendar, Holiday
 
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error
@@ -40,6 +39,15 @@ except Exception:  # pragma: no cover
     SARIMAX = None
     ConvergenceWarning = RuntimeError  # dummy
     HAVE_STATSMODELS = False
+
+# Optional holidays (Slovenia) support
+try:
+    import holidays as _holidays_pkg
+
+    HAVE_HOLIDAYS = True
+except Exception:  # pragma: no cover
+    _holidays_pkg = None
+    HAVE_HOLIDAYS = False
 
 # -----------------------------------------------------------------------------
 # Global determinism
@@ -68,8 +76,13 @@ def smape(y_true: Iterable[float], y_pred: Iterable[float], eps: float = 1e-8) -
     return float(np.mean(2.0 * np.abs(y_pred - y_true) / denom))
 
 
-def mase(y_true: Iterable[float], y_pred: Iterable[float], y_insample: Iterable[float],
-         m: int = 1, eps: float = 1e-8) -> float:
+def mase(
+        y_true: Iterable[float],
+        y_pred: Iterable[float],
+        y_insample: Iterable[float],
+        m: int = 1,
+        eps: float = 1e-8
+) -> float:
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     y_insample = np.asarray(y_insample, dtype=float)
@@ -84,11 +97,11 @@ def _infer_seasonal_period(y: pd.Series) -> int:
         if not freq:
             return 1
         off = pd.tseries.frequencies.to_offset(freq)
-        base = off.name  # e.g. 'D','H','W-SUN','M'
-        if base.startswith("D"):
-            return 7
+        base = off.name  # 'D','H','W-SUN','M',...
         if base.startswith("H"):
             return 24
+        if base.startswith("D"):
+            return 7
         if base.startswith("W"):
             return 52
         if base.startswith("M"):
@@ -108,25 +121,12 @@ class FeatureConfig:
     add_calendar: bool = True
 
 
-class SloveniaHolidays(AbstractHolidayCalendar):
-    rules = [
-        Holiday('New Year', month=1, day=1),
-        Holiday('New Year 2', month=1, day=2),
-        Holiday('Prešern day', month=2, day=8),
-        Holiday('Dan upora proti okupatorju', month=4, day=27),
-        Holiday('May Day', month=5, day=1),
-        Holiday('May Day 2', month=5, day=2),
-        Holiday('Binkošti', month=6, day=8),
-        Holiday('Statehood Day', month=6, day=25),
-        Holiday('Marijino vnebovzetje', month=8, day=15),
-        Holiday('Dan reformacije', month=10, day=31),
-        Holiday('Dan spomina na mrtve', month=11, day=1),
-        Holiday('Božič', month=12, day=25),
-        Holiday('Dan samostojnosti in enotnosti', month=12, day=26),
-    ]
-
-
 def _calendar_df(idx: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Calendar features for a given DatetimeIndex.
+    Uses 'holidays' package for Slovenia when available; otherwise falls back to
+    a basic, fixed-date list (movable feasts will not be fully accurate).
+    """
     cal = pd.DataFrame(index=idx)
     cal["dow"] = idx.dayofweek.astype("int8")
     cal["weekofyear"] = idx.isocalendar().week.astype("int16")
@@ -137,13 +137,30 @@ def _calendar_df(idx: pd.DatetimeIndex) -> pd.DataFrame:
     cal["is_month_end"] = idx.is_month_end.astype("int8")
     cal["is_weekend"] = (idx.dayofweek >= 5).astype("int8")
     cal["year"] = idx.year.astype("int16")
-    holidays = SloveniaHolidays().holidays(idx.min(), idx.max())
-    cal["is_holiday"] = idx.isin(holidays).astype("int8")
+
+    if HAVE_HOLIDAYS:
+        years = sorted(set(idx.year))
+        try:
+            si_holidays = _holidays_pkg.country_holidays("SI", years=years)
+            cal["is_holiday"] = idx.map(lambda d: 1 if d in si_holidays else 0).astype("int8")
+        except Exception:
+            cal["is_holiday"] = 0
+    else:
+        # Basic fallback (approximate; no movable feasts)
+        fixed = set()
+        for y in sorted(set(idx.year)):
+            for m, d in [(1, 1), (1, 2), (2, 8), (4, 27), (5, 1), (5, 2),
+                         (6, 25), (8, 15), (10, 31), (11, 1), (12, 25), (12, 26)]:
+                try:
+                    fixed.add(pd.Timestamp(year=y, month=m, day=d))
+                except Exception:
+                    pass
+        cal["is_holiday"] = idx.isin(sorted(fixed)).astype("int8")
     return cal
 
 
 # -----------------------------------------------------------------------------
-# RF feature engineering (unchanged behavior)
+# RF feature engineering
 # -----------------------------------------------------------------------------
 def make_features(
         y: pd.Series,
@@ -155,6 +172,7 @@ def make_features(
     for lag in cfg.lags:
         X[f"lag_{lag}"] = y.shift(lag)
     for w in cfg.roll_windows:
+        # shift(1) to prevent leakage of current point
         X[f"roll_mean_{w}"] = y.shift(1).rolling(window=w, min_periods=w).mean()
     if cfg.add_calendar:
         X = X.join(_calendar_df(y.index))
@@ -176,24 +194,37 @@ def _coerce_regular_freq(
         y: pd.Series,
         exog: Optional[pd.DataFrame],
         freq: Optional[str] = None,
-        y_fill: float = 0.0
+        y_fill: float = 0.0,
+        max_ffill_steps: Optional[int] = None
 ) -> Tuple[pd.Series, Optional[pd.DataFrame], str]:
-    """Ensure DateTimeIndex with an explicit, regular frequency; reindex & fill."""
+    """
+    Ensure DateTimeIndex with an explicit, regular frequency; reindex & fill.
+    max_ffill_steps: if provided, cap forward-fill span. Remaining NaNs → y_fill.
+    """
     idx = y.index
     if not isinstance(idx, (pd.DatetimeIndex, pd.PeriodIndex)):
         idx = pd.to_datetime(idx, errors="coerce", utc=False)
         y = pd.Series(y.values, index=idx, name=y.name)
+
     f = freq or (y.index.freqstr or pd.infer_freq(y.index))
     if f is None:
         f = "D"
+
     full = pd.date_range(y.index.min(), y.index.max(), freq=f)
-    y2 = y.reindex(full).astype(float).ffill().fillna(y_fill)
+    y2 = y.reindex(full).astype(float)
+    if max_ffill_steps is not None:
+        y2 = y2.fillna(method="ffill", limit=max_ffill_steps)
+    else:
+        y2 = y2.ffill()
+    y2 = y2.fillna(y_fill)
+
     ex2 = None
     if exog is not None:
         if not isinstance(exog.index, (pd.DatetimeIndex, pd.PeriodIndex)):
             exog = exog.copy()
             exog.index = pd.to_datetime(exog.index, errors="coerce", utc=False)
         ex2 = exog.reindex(full)
+
     return y2, ex2, f
 
 
@@ -213,7 +244,9 @@ def _build_exog_future_if_needed(
         horizon: int,
         hist_df: pd.DataFrame | None = None,
 ) -> Optional[pd.DataFrame]:
-    """Synthesize future exog when not supplied: persist last value (binary→0)."""
+    """
+    Synthesize future exog when not supplied: persist last value (binary→0).
+    """
     if not exog_cols:
         return None
     future_idx = _build_future_index(y_index, horizon)
@@ -234,7 +267,7 @@ def _build_exog_future_if_needed(
 
 
 # -----------------------------------------------------------------------------
-# SARIMAX-specific exog builder
+# SARIMAX-specific: exog preparation (no standardization)
 # -----------------------------------------------------------------------------
 def _exog_matrix_for_sarimax(
         y_index: pd.DatetimeIndex,
@@ -242,11 +275,8 @@ def _exog_matrix_for_sarimax(
         add_calendar: bool = True,
 ) -> pd.DataFrame:
     """
-    - Align to y_index
-    - Replace inf/NaN (ffill→0)
-    - Drop non-numeric and constant columns
-    - Z-score standardize
-    - Optionally append calendar features (also standardized)
+    Align/clean/drop-constants for exogenous matrix.
+    NOTE: No standardization here; SARIMAX model applies train μ/σ to both train and future.
     """
     if X is None or (isinstance(X, pd.DataFrame) and X.empty):
         base = pd.DataFrame(index=y_index)
@@ -257,26 +287,24 @@ def _exog_matrix_for_sarimax(
         base = base.reindex(y_index)
 
     base = base.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0)
+
     # Num-cast and drop non-numeric
     for c in list(base.columns):
         if not pd.api.types.is_numeric_dtype(base[c]):
             base[c] = pd.to_numeric(base[c], errors="coerce").fillna(0.0)
         base[c] = base[c].astype(float)
+
     # Drop constants
     if not base.empty:
         std = base.std(ddof=0)
         keep = std[std > 1e-12].index.tolist()
         base = base[keep]
-    # Z-score
-    if not base.empty:
-        mu = base.mean()
-        sigma = base.std(ddof=0).replace(0.0, 1.0)
-        base = (base - mu) / sigma
-    # Calendar
+
+    # Calendar (no standardization here)
     if add_calendar:
         cal = _calendar_df(y_index).astype(float)
-        cal = (cal - cal.mean()) / cal.std(ddof=0).replace(0.0, 1.0)
         base = pd.concat([base, cal], axis=1)
+
     base = base.replace([np.inf, -np.inf], 0.0).fillna(0.0)
     return base
 
@@ -285,56 +313,29 @@ def _normalize_sarimax_search_space(
         search_space: Dict[str, Any] | List[Dict[str, Any]] | None
 ) -> List[Dict[str, Any]]:
     """
-    Accepts:
-      - None / {} -> [{}]
-      - [{"order":[1,1,1], "seasonal_order":[1,1,1,7]}]  -> treat as single literal spec
-      - {"order":[(1,1,1),(2,1,1)], "seasonal_order":[(1,1,1,7)]} -> proper grid over tuples
-      - [{"order":(1,1,1), "seasonal_order":(1,1,1,7)}, ...] -> literal list
-
-    Returns a list of dicts with 'order' and 'seasonal_order' as tuples, ready to fit.
+    Accepts literal dicts, lists of dicts, or dicts with lists-of-tuples for grid.
+    Returns a list of dicts with 'order' and 'seasonal_order' as tuples where provided.
     """
     if search_space in (None, {}, []):
         return [{}]
 
-    # Case A: list of dicts → treat each dict as a literal spec
     if isinstance(search_space, list):
         out: List[Dict[str, Any]] = []
         for d in search_space:
             dd = dict(d)
-            if "order" in dd:
-                v = dd["order"]
-                if isinstance(v, list) and all(isinstance(x, (int, np.integer)) for x in v) and len(v) == 3:
-                    dd["order"] = tuple(v)
-                elif isinstance(v, tuple):
-                    pass
-                else:
-                    # If it's a list of tuples, keep literal; caller wanted explicit combos
-                    dd["order"] = tuple(v) if isinstance(v, list) and len(v) == 3 else v
-            if "seasonal_order" in dd:
-                v = dd["seasonal_order"]
-                if isinstance(v, list) and all(isinstance(x, (int, np.integer)) for x in v) and len(v) == 4:
-                    dd["seasonal_order"] = tuple(v)
-                elif isinstance(v, tuple):
-                    pass
-                else:
-                    dd["seasonal_order"] = tuple(v) if isinstance(v, list) and len(v) == 4 else v
+            if "order" in dd and isinstance(dd["order"], list) and len(dd["order"]) == 3:
+                dd["order"] = tuple(dd["order"])
+            if "seasonal_order" in dd and isinstance(dd["seasonal_order"], list) and len(dd["seasonal_order"]) == 4:
+                dd["seasonal_order"] = tuple(dd["seasonal_order"])
             out.append(dd)
         return out
 
-    # Case B: dict → only grid when values are lists of tuples
     if isinstance(search_space, dict):
-        # Are values lists of tuples? If yes, do a real grid.
-        is_grid = False
-        for k, v in search_space.items():
-            if isinstance(v, list) and v and all(isinstance(t, tuple) for t in v):
-                is_grid = True
-                break
-
+        # Grid if any value is list of tuples
+        is_grid = any(isinstance(v, list) and v and all(isinstance(t, tuple) for t in v)
+                      for v in search_space.values())
         if is_grid:
-            # Proper grid over tuples
             return [dict(p) for p in ParameterGrid(search_space)]
-
-        # Otherwise treat as literal one spec
         d = dict(search_space)
         if "order" in d and isinstance(d["order"], list) and len(d["order"]) == 3:
             d["order"] = tuple(d["order"])
@@ -342,7 +343,6 @@ def _normalize_sarimax_search_space(
             d["seasonal_order"] = tuple(d["seasonal_order"])
         return [d]
 
-    # Fallback
     return [{}]
 
 
@@ -350,15 +350,17 @@ def _normalize_sarimax_search_space(
 # Models
 # -----------------------------------------------------------------------------
 def _detect_nested_multiprocessing() -> bool:
+    """Heuristic: if inside a non-main process or forced via env, avoid spawning."""
     try:
         import multiprocessing as mp
         if mp.current_process().name != "MainProcess":
             return True
     except Exception:
         pass
+    # Respect a user override to force threading
     start_method = os.environ.get("JOBLIB_START_METHOD", "").lower()
     if start_method and start_method not in ("threading",):
-        pass
+        return True
     return False
 
 
@@ -371,7 +373,7 @@ class BaseModel:
 
 
 class RFRegressorModel(BaseModel):
-    """RandomForest forecaster using lag/rolling/calendar features (unchanged)."""
+    """RandomForest forecaster using lag/rolling/calendar features."""
 
     def __init__(self, **kwargs: Any):
         if "n_jobs" in kwargs:
@@ -382,11 +384,15 @@ class RFRegressorModel(BaseModel):
             "Initializing RandomForestRegressor with n_jobs=%s (%s)",
             n_jobs, "nested-mp-safe" if n_jobs == 1 else "max-parallel"
         )
-        self.model = RandomForestRegressor(
-            random_state=42, n_estimators=400, n_jobs=n_jobs, **kwargs
-        )
+
+        # Avoid double-passing of parameters coming from grid search
+        kwargs = dict(kwargs)
+        kwargs.setdefault("random_state", 42)
+        kwargs.setdefault("n_estimators", 400)
+
+        self.model = RandomForestRegressor(n_jobs=n_jobs, **kwargs)
         self._fitted = False
-        self.feature_names_: List[str] | None = None
+        self.feature_names_ = None
 
     def fit(self, y: pd.Series, X: pd.DataFrame) -> "RFRegressorModel":
         mask = X.notna().all(axis=1) & y.notna()
@@ -425,9 +431,9 @@ class RFRegressorModel(BaseModel):
         for ts in future_index:
             feat: Dict[str, Any] = {}
             for lag in feat_cfg.lags:
-                feat[f"lag_{lag}"] = float(y_aug.iloc[-lag]) if len(y_aug) >= lag else np.nan
+                feat[f"lag_{lag}"] = float(y_aug.iloc[-lag]) if len(y_aug) >= lag else 0.0
             for w in feat_cfg.roll_windows:
-                feat[f"roll_mean_{w}"] = float(y_aug.iloc[-w:].mean()) if len(y_aug) >= w else np.nan
+                feat[f"roll_mean_{w}"] = float(y_aug.iloc[-w:].mean()) if len(y_aug) >= w else 0.0
             if feat_cfg.add_calendar:
                 cal_ts = _calendar_df(pd.DatetimeIndex([ts])).iloc[0].to_dict()
                 feat.update({k: float(v) for k, v in cal_ts.items()})
@@ -435,8 +441,8 @@ class RFRegressorModel(BaseModel):
                 if ts not in exog_future.index:
                     raise ValueError("exog_future must be indexed by future timestamps.")
                 for col, val in exog_future.loc[ts].items():
-                    feat[col] = float(val) if pd.notna(val) else np.nan
-            x_row_df = pd.DataFrame([feat], index=pd.DatetimeIndex([ts])).ffill().bfill()
+                    feat[col] = float(val) if pd.notna(val) else 0.0
+            x_row_df = pd.DataFrame([feat], index=pd.DatetimeIndex([ts]))
             if self.feature_names_ is not None:
                 x_row_df = x_row_df.reindex(columns=self.feature_names_, fill_value=0)
             y_hat = float(self.model.predict(x_row_df)[0])
@@ -446,7 +452,7 @@ class RFRegressorModel(BaseModel):
 
 
 class SarimaxModel(BaseModel):
-    """Robust SARIMAX with multiple optimizer retries."""
+    """Robust SARIMAX with consistent exogenous scaling (train μ/σ reused)."""
 
     def __init__(self, order=(1, 1, 1), seasonal_order=(0, 1, 1, 7)):
         if not HAVE_STATSMODELS:
@@ -458,12 +464,35 @@ class SarimaxModel(BaseModel):
         self._train_calendar = True
         self._train_index: Optional[pd.DatetimeIndex] = None
         self._train_freq: Optional[str] = None
+        self._exog_mu: Optional[pd.Series] = None
+        self._exog_sigma: Optional[pd.Series] = None
+
+    def _standardize_like_train(self, Xf: pd.DataFrame) -> pd.DataFrame:
+        if self._exog_mu is None or self._exog_sigma is None:
+            return Xf
+        # add missing cols and order exactly as training
+        for c in self._train_exog_cols:
+            if c not in Xf.columns:
+                Xf[c] = 0.0
+        Xf = Xf[self._train_exog_cols]
+        return (Xf - self._exog_mu) / self._exog_sigma.replace(0.0, 1.0)
 
     def fit(self, y: pd.Series, X: Optional[pd.DataFrame] = None) -> "SarimaxModel":
         y2, freq = _ensure_supported_index(y)
         if not freq:
             y2, _, freq = _coerce_regular_freq(y2, None, freq="D", y_fill=0.0)
-        X2 = _exog_matrix_for_sarimax(y2.index, X, add_calendar=True)
+
+        # Clean exog; no standardization here
+        X2_raw = _exog_matrix_for_sarimax(y2.index, X, add_calendar=True)
+
+        # compute and store μ/σ; apply to training exog
+        if not X2_raw.empty:
+            self._exog_mu = X2_raw.mean()
+            self._exog_sigma = X2_raw.std(ddof=0).replace(0.0, 1.0)
+            X2 = (X2_raw - self._exog_mu) / self._exog_sigma
+        else:
+            X2 = X2_raw
+
         self._train_exog_cols = list(X2.columns)
         self._train_calendar = True
         self._train_index = y2.index
@@ -536,12 +565,11 @@ class SarimaxModel(BaseModel):
         else:
             if not isinstance(X_future.index, (pd.DatetimeIndex, pd.PeriodIndex)):
                 X_future.index = pd.to_datetime(X_future.index, errors="coerce", utc=False)
+
         Xf = X_future.reindex(_build_future_index(self._train_index, horizon))
         Xf = _exog_matrix_for_sarimax(Xf.index, Xf, add_calendar=self._train_calendar)
-        missing_cols = [c for c in self._train_exog_cols if c not in Xf.columns]
-        for c in missing_cols:
-            Xf[c] = 0.0
-        Xf = Xf[self._train_exog_cols]
+        Xf = self._standardize_like_train(Xf)
+
         fc = self.result.get_forecast(steps=horizon, exog=(Xf if not Xf.empty else None))
         return np.asarray(fc.predicted_mean, dtype=float)
 
@@ -587,8 +615,8 @@ def rolling_backtest(
 
     if model_name == "rf":
         X_full = make_features(y, feat_cfg, exog)
-    else:  # sarimax uses exog only; calendar is appended inside its fit
-        X_full = exog.copy() if exog is not None else None
+    else:
+        X_full = exog.copy() if exog is not None else None  # SARIMAX uses exog only
 
     preds_list: List[pd.Series] = []
     trues_list: List[pd.Series] = []
@@ -619,7 +647,6 @@ def rolling_backtest(
             y_hat = m.predict_iterative(y_hist=y_train, horizon=horizon, feat_cfg=feat_cfg, exog_future=exog_future)
         else:
             X_train = X_full.iloc[:i] if X_full is not None else None
-            # For forecast window, provide future exog (or synthesize)
             if exog is not None:
                 exog_future = exog.iloc[i:i + horizon]
                 if exog_future.shape[0] != horizon:
@@ -662,15 +689,6 @@ def rolling_backtest(
     )
 
 
-def _coerce_sarimax_params(p: Dict[str, Any]) -> Dict[str, Any]:
-    q = dict(p)
-    if "order" in q and isinstance(q["order"], (list, tuple)):
-        q["order"] = tuple(q["order"])
-    if "seasonal_order" in q and isinstance(q["seasonal_order"], (list, tuple)):
-        q["seasonal_order"] = tuple(q["seasonal_order"])
-    return q
-
-
 def grid_search(
         y: pd.Series,
         horizon: int,
@@ -684,20 +702,7 @@ def grid_search(
     model_cls = ModelRegistry[model_name]
 
     if model_name == "sarimax":
-        # Normalize so {'order':[1,1,1]} is treated as a *literal* not a grid,
-        # and only lists of tuples trigger true grid expansion.
         param_iter = _normalize_sarimax_search_space(search_space)
-
-        # Ensure tuple types
-        def _coerce(p: Dict[str, Any]) -> Dict[str, Any]:
-            q = dict(p)
-            if "order" in q and isinstance(q["order"], list):
-                q["order"] = tuple(q["order"])
-            if "seasonal_order" in q and isinstance(q["seasonal_order"], list):
-                q["seasonal_order"] = tuple(q["seasonal_order"])
-            return q
-
-        param_iter = [_coerce(p) for p in param_iter]
     else:
         if search_space in (None, {}):
             param_iter = [{}]
@@ -786,7 +791,6 @@ def train_full_and_forecast(
         m.fit(y, X_train)
         y_hat = m.predict_iterative(y_hist=y, horizon=horizon, feat_cfg=feat_cfg, exog_future=exog_future)
     else:
-        # SARIMAX uses exog only; calendar/standardization handled in model
         X_train = exog.copy() if exog is not None else None
         exog_future = None
         if exog is not None:
@@ -826,6 +830,9 @@ class RunConfig:
     log_level: int = logging.INFO
     # Serialization
     max_serialize_points: Optional[int] = None
+    # Optional controls
+    mase_m: Optional[int] = None  # override seasonal period for MASE
+    max_ffill_steps: Optional[int] = None  # cap ffill span in _coerce_regular_freq
 
     def __post_init__(self):
         if self.feature_config is None:
@@ -836,7 +843,6 @@ class RunConfig:
             )
         if self.search_space is None:
             if self.model_name == "sarimax":
-                # Small, stable space for daily data with weekly seasonality
                 self.search_space = [
                     {"order": (1, 1, 1), "seasonal_order": (1, 1, 1, 7)},
                     {"order": (2, 1, 1), "seasonal_order": (1, 1, 1, 7)},
@@ -897,15 +903,16 @@ def _prepare_inputs(
         target: Optional[str],
         ts_col: Optional[str],
         exog_cols: Optional[List[str]],
-        use_exog: bool
+        use_exog: bool,
+        max_ffill_steps: Optional[int] = None
 ) -> Tuple[pd.Series, Optional[pd.DataFrame]]:
-    """Return y (Series with DateTimeIndex and regular freq) and exog aligned to y (or None)."""
+    """Return y (Series with DateTimeIndex & regular freq) and exog aligned to y (or None)."""
     if isinstance(data, pd.Series):
         y = data.copy()
         if not isinstance(y.index, (pd.DatetimeIndex, pd.PeriodIndex)):
             y.index = pd.to_datetime(y.index, errors="raise", utc=False)
         y = y.sort_index()
-        y, _, _ = _coerce_regular_freq(y, None, freq=None, y_fill=0.0)
+        y, _, _ = _coerce_regular_freq(y, None, freq=None, y_fill=0.0, max_ffill_steps=max_ffill_steps)
         return y, None
 
     if not isinstance(data, pd.DataFrame):
@@ -924,7 +931,7 @@ def _prepare_inputs(
     y = df[y_col].astype(float).copy()
 
     # Ensure regular frequency on y (and exog aligned)
-    y, exog, _ = _coerce_regular_freq(y, exog, freq=None, y_fill=0.0)
+    y, exog, _ = _coerce_regular_freq(y, exog, freq=None, y_fill=0.0, max_ffill_steps=max_ffill_steps)
 
     if exog is not None and y_col in exog.columns:
         exog = exog.drop(columns=[y_col])
@@ -953,21 +960,40 @@ def run_forecasting(
     """
     logging.getLogger().setLevel(config.log_level)
 
+    # Early model availability check
+    if config.model_name not in ModelRegistry:
+        raise ValueError(
+            f"Requested model '{config.model_name}' is unavailable. "
+            f"Installed models: {sorted(ModelRegistry.keys())}. "
+            f"(Install 'statsmodels' to enable SARIMAX.)"
+        )
+
     # Prepare inputs
     y, exog = _prepare_inputs(
         data=data,
         target=target,
         ts_col=ts_col,
         exog_cols=exog_cols,
-        use_exog=config.use_exog
+        use_exog=config.use_exog,
+        max_ffill_steps=config.max_ffill_steps
     )
 
-    # Early validation
+    # Early validation: length
     min_len = config.initial_train + config.horizon
     if len(y) < min_len:
         raise ValueError(
-            f"Series too short: len(y)={len(y)} < initial_train+horizon={min_len}"
+            f"Series too short: len(y)={len(y)} < initial_train+horizon={min_len} "
+            f"(initial_train={config.initial_train}, horizon={config.horizon})."
         )
+
+    # Early validation: RF needs sufficient initial_train vs lag/roll
+    if config.model_name == "rf":
+        need = 0
+        if config.feature_config:
+            candidates = (config.feature_config.lags or []) + (config.feature_config.roll_windows or [])
+            need = max(candidates) if candidates else 0
+        if config.initial_train <= need:
+            raise ValueError(f"initial_train must exceed max(lag/roll)={need} for RF features.")
 
     # Optionally enforce explicit frequency
     if freq is not None:
@@ -980,7 +1006,7 @@ def run_forecasting(
     log.info("=== run_forecasting ===")
     log.info("Series length=%d | range=[%s .. %s]", len(y), y.index.min(), y.index.max())
     log.info("Config: %s", asdict(config))
-    if exog is not None:
+    if exog is not None and config.use_exog:
         log.info("Using exogenous columns: %s", list(exog.columns))
 
     # Search + backtest

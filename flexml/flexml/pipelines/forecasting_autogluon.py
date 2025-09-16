@@ -1,41 +1,24 @@
 """
-AutoGluon TimeSeries forecasting (AG >= 1.1.0)
-
-This module provides a self-contained path to run forecasting using AutoGluon
-without disturbing your existing RF / SARIMAX logic.
+AutoGluon TimeSeries forecasting (compatible with AG versions with/without known_covariates)
 
 Key features:
 - Robust construction of TimeSeriesDataFrame for single or multi-series
-- Optional known covariates (a.k.a. exogenous / regressors)
-- Frequency normalization (convert_frequency) and index alignment
-- Simple synthesis of future covariates if you don't have them
-- JSON-friendly output compatible with your current results structure
-
-Typical usage (from tasks.py):
-    result = run_autogluon_forecasting(
-        df,                               # pandas DataFrame
-        target="request_cnt",
-        ts_col="dt",
-        exog_cols=["total_color_kg", "distinct_user_creators", "distinct_colors"],
-        horizon=21,
-        time_limit=600,
-        hyperparameters={"SeasonalNaive": {}, "AutoETS": {}},
-        prediction_item_id="series_0",
-        freq="D",
-        save_dir=None,                    # or a path to save the predictor
-    )
+- Optional known covariates; gracefully disabled if unsupported by installed AG version
+- Frequency normalization and index alignment (tz-naive Timestamps)
+- JSON-friendly output aligned with other pipelines
 """
 
 from __future__ import annotations
 
-import json
+import inspect
 import logging
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
+# Optional AutoGluon support
 try:
     from autogluon.timeseries import TimeSeriesDataFrame, TimeSeriesPredictor
 
@@ -60,16 +43,20 @@ class AGConfig:
     hyperparameters: Optional[dict] = None
     eval_metric: str = "MAPE"
     verbosity: int = 2
-    # If you pass a directory, we'll save the trained predictor
     save_dir: Optional[str] = None
 
 
 # ---------------------------- Helpers ----------------------------------------
 
-
 def _ensure_datetime(series: pd.Series) -> pd.Series:
     """Coerce a column to datetime (raise if totally invalid)."""
-    s = pd.to_datetime(series, errors="raise")
+    s = pd.to_datetime(series, errors="raise", utc=False)
+    # Strip timezone if present
+    try:
+        if getattr(s.dt, "tz", None) is not None:
+            s = s.dt.tz_convert(None)
+    except Exception:
+        pass
     return s
 
 
@@ -85,23 +72,181 @@ def _ensure_item_id(df: pd.DataFrame, item_id_col: Optional[str]) -> Tuple[pd.Da
     return df, item_id_col
 
 
+def _parse_datetimes_safely(values) -> pd.DatetimeIndex:
+    """
+    Parse to tz-naive Timestamps without emitting the pandas 'Could not infer format' warning.
+    Strategy:
+      1) Normalize Period -> Timestamp.
+      2) Try to detect a uniform format across a small sample and use vectorized parse with format=...
+      3) If not reliable, fall back to element-wise parsing (no warning).
+    """
+    # Fast paths for already-datetime index types
+    if isinstance(values, pd.DatetimeIndex):
+        ts = values
+    elif isinstance(values, pd.PeriodIndex):
+        ts = values.to_timestamp()
+    else:
+        # Flatten into a list and normalize Period elements
+        try:
+            seq = list(values)
+        except TypeError:
+            seq = [values]
+        flat = []
+        for v in seq:
+            if isinstance(v, pd.Period):
+                flat.append(v.to_timestamp())
+            else:
+                flat.append(v)
+
+        # Try to detect a uniform string format on a small sample
+        str_vals = [v for v in flat if isinstance(v, str)]
+        fmt = None
+        if str_vals:
+            sample = [s.strip() for s in str_vals[:50] if s and s.strip()]
+
+            def all_match(p):
+                return len(sample) > 0 and all(re.match(p, s) for s in sample)
+
+            # Pure date patterns
+            if all_match(r"^\d{4}-\d{2}-\d{2}$"):
+                fmt = "%Y-%m-%d"
+            elif all_match(r"^\d{4}/\d{2}/\d{2}$"):
+                fmt = "%Y/%m/%d"
+            elif all_match(r"^\d{2}\.\d{2}\.\d{4}$"):
+                fmt = "%d.%m.%Y"
+            elif all_match(r"^\d{2}/\d{2}/\d{4}$"):
+                # Disambiguate dd/mm vs mm/dd by looking for any day>12
+                parts = [s.split("/") for s in sample]
+                if any(p[0].isdigit() and int(p[0]) > 12 for p in parts if len(p) == 3):
+                    fmt = "%d/%m/%Y"
+                else:
+                    fmt = "%m/%d/%Y"
+            # Datetime (seconds)
+            elif all_match(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$"):
+                fmt = "%Y-%m-%dT%H:%M:%S" if "T" in sample[0] else "%Y-%m-%d %H:%M:%S"
+            # Datetime (minutes)
+            elif all_match(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}$"):
+                fmt = "%Y-%m-%dT%H:%M" if "T" in sample[0] else "%Y-%m-%d %H:%M"
+
+        if fmt:
+            # Vectorized parse with explicit format (fast, no warning)
+            ts = pd.to_datetime(flat, errors="coerce", utc=False, format=fmt)
+        else:
+            # Element-wise parse to avoid the global-warning path
+            parsed = [pd.to_datetime(v, errors="coerce", utc=False) for v in flat]
+            ts = pd.DatetimeIndex(parsed)
+
+    # Strip timezone if present
+    try:
+        if isinstance(ts, pd.DatetimeIndex) and ts.tz is not None:
+            ts = ts.tz_convert(None)
+    except Exception:
+        pass
+    try:
+        if isinstance(ts, pd.DatetimeIndex) and ts.tz is not None:
+            ts = ts.tz_localize(None)
+    except Exception:
+        pass
+
+    return ts
+
+
+def _ensure_two_level_index(idx: pd.Index) -> pd.MultiIndex:
+    """
+    Normalize any index to a 2-level MultiIndex [item_id, timestamp] with tz-naive
+    pandas Timestamps at level 1. Robust to:
+      - Mixed level ordering (detect timestamp level automatically)
+      - PeriodIndex or arrays of Period (converted via .to_timestamp())
+      - tz-aware datetimes (tz removed)
+      - Index of tuples (item, timestamp) in any order
+      - Single DatetimeIndex (treated as single-series with item_id="0")
+    """
+
+    def _is_timestamp_like(level_vals) -> bool:
+        # Quick heuristics: true for Datetime/Period index; else try parsing a small sample
+        if isinstance(level_vals, (pd.DatetimeIndex, pd.PeriodIndex)):
+            return True
+        try:
+            # Parse a tiny sample to avoid O(n) cost
+            seq = list(level_vals[:20]) if hasattr(level_vals, "__getitem__") else list(level_vals)
+            ts = _parse_datetimes_safely(seq)
+            if len(ts) == 0:
+                return False
+            nat_ratio = float(ts.isna().mean())
+            return nat_ratio <= 0.05
+        except Exception:
+            return False
+
+    def _build_mi(item_vals, ts_vals) -> pd.MultiIndex:
+        item_idx = pd.Index([str(x) for x in item_vals], dtype=str)
+        ts_idx = _parse_datetimes_safely(ts_vals)
+        if ts_idx.isna().any():
+            bad = int(ts_idx.isna().sum())
+            raise ValueError(f"Timestamp level contains unparseable values (NaT count={bad}).")
+        return pd.MultiIndex.from_arrays([item_idx, ts_idx], names=["item_id", "timestamp"])
+
+    # Case A: MultiIndex — auto-detect which level is timestamp-like
+    if isinstance(idx, pd.MultiIndex):
+        n = idx.nlevels
+        if n >= 2:
+            lvl_vals = [idx.get_level_values(i) for i in range(n)]
+            ts_candidates = [i for i in range(n) if _is_timestamp_like(lvl_vals[i])]
+            ts_level = ts_candidates[-1] if ts_candidates else (n - 1)
+            item_level = 0 if ts_level != 0 else (1 if n > 1 else 0)
+            return _build_mi(lvl_vals[item_level], lvl_vals[ts_level])
+
+        # Rare: MI with 1 level. Try rebuilding from tuples.
+        tuples = list(idx)
+        if not tuples:
+            return pd.MultiIndex.from_arrays(
+                [pd.Index([], dtype=str), pd.DatetimeIndex([])],
+                names=["item_id", "timestamp"],
+            )
+        cand0 = [t[0] for t in tuples]
+        cand1 = [t[1] for t in tuples]
+        if _is_timestamp_like(cand0) and not _is_timestamp_like(cand1):
+            return _build_mi(cand1, cand0)
+        if _is_timestamp_like(cand1):
+            return _build_mi(cand0, cand1)
+        return _build_mi(cand0, cand1)
+
+    # Case B: Non-MI: maybe Index of tuples (item, timestamp) in either order
+    try:
+        tuples = list(idx)
+        if tuples and isinstance(tuples[0], tuple) and len(tuples[0]) >= 2:
+            cand0 = [t[0] for t in tuples]
+            cand1 = [t[1] for t in tuples]
+            if _is_timestamp_like(cand0) and not _is_timestamp_like(cand1):
+                return _build_mi(cand1, cand0)
+            if _is_timestamp_like(cand1):
+                return _build_mi(cand0, cand1)
+            return _build_mi(cand0, cand1)
+    except Exception:
+        pass
+
+    # Case C: Single index ⇒ treat as single-series timestamps
+    ts = _parse_datetimes_safely(idx)
+    if ts.isna().any():
+        bad = int(ts.isna().sum())
+        raise ValueError(f"Timestamp level contains unparseable values (NaT count={bad}).")
+    items = pd.Index(["0"] * len(ts), dtype=str)
+    return pd.MultiIndex.from_arrays([items, ts], names=["item_id", "timestamp"])
+
+
 def _to_tsdf(
         df: pd.DataFrame,
         item_id_col: str,
         ts_col: str,
         value_cols: List[str],
         freq: str,
-) -> TimeSeriesDataFrame:
+        fill_na: bool,
+        agg_numeric: str = "mean",
+) -> "TimeSeriesDataFrame":
     """
     Convert a long-form DataFrame into a TimeSeriesDataFrame with given value columns.
-    For target, pass value_cols=[target].
-    For covariates, pass value_cols=exog_cols.
-
-    Notes:
-        - We call convert_frequency(freq) to normalize to a regular grid.
-        - We forward/back fill within each item_id to handle occasional gaps.
+    For target, pass value_cols=[target] and fill_na=False.
+    For covariates, pass value_cols=exog_cols and fill_na=True.
     """
-    # Prepare a narrow DF: item_id | timestamp | <values...>
     keep = [item_id_col, ts_col] + value_cols
     miss = [c for c in keep if c not in df.columns]
     if miss:
@@ -119,136 +264,45 @@ def _to_tsdf(
     )
 
     # Normalize to regular frequency
-    ts = ts.convert_frequency(freq=freq, agg_numeric="mean")
+    ts = ts.convert_frequency(freq=freq, agg_numeric=agg_numeric)
 
-    # ffill/bfill per item to remove NaNs introduced by regularization (safe for covariates)
-    ts = ts.groupby(level=0).apply(lambda g: g.ffill().bfill())
+    # ffill/bfill per item for covariates only
+    if fill_na:
+        ts = ts.groupby(level=0).apply(lambda g: g.ffill().bfill())
+
+    # Normalize index for downstream ops
+    ts.index = _ensure_two_level_index(ts.index)
     return ts
-
-
-def _as_two_level_index(idx: pd.Index) -> pd.MultiIndex:
-    """
-    Normalize a TimeSeriesDataFrame index to a 2-level MultiIndex
-    [item_id, timestamp] with consistent names. Works across AG versions.
-
-    - If already 2-level MI -> just ensure names.
-    - If MI with >2 levels   -> keep the first two (item_id, timestamp).
-    - If not MI (unlikely)   -> build from tuples.
-    """
-    if isinstance(idx, pd.MultiIndex):
-        if idx.nlevels == 2:
-            return idx.set_names(["item_id", "timestamp"])
-        # fallback: keep the first two levels
-        lvl0 = idx.get_level_values(0)
-        lvl1 = idx.get_level_values(1)
-        return pd.MultiIndex.from_arrays([lvl0, lvl1], names=["item_id", "timestamp"])
-    else:
-        # Some older conversions might return a sequence of tuples
-        # or an Index of tuple-like values.
-        try:
-            tuples = list(idx)
-            return pd.MultiIndex.from_tuples(tuples, names=["item_id", "timestamp"])
-        except Exception as e:
-            raise ValueError(f"Unexpected index type/shape for TimeSeriesDataFrame: {type(idx)}") from e
-
-
-def _normalize_ts_index(idx: pd.Index) -> pd.MultiIndex:
-    """
-    Return a 2-level MultiIndex [item_id, timestamp] with the timestamp level
-    converted to tz-naive datetime64[ns]. Works across AG versions.
-    """
-    # Build a 2-level MI [item, ts]
-    if isinstance(idx, pd.MultiIndex):
-        # take first two levels if there are more
-        lvl_item = idx.get_level_values(0)
-        lvl_ts = idx.get_level_values(1)
-    else:
-        # idx might be an Index of tuples
-        tuples = list(idx)
-        if not tuples or not isinstance(tuples[0], tuple) or len(tuples[0]) < 2:
-            raise ValueError(f"Unexpected index shape/type: {type(idx)}")
-        lvl_item = pd.Index([t[0] for t in tuples])
-        lvl_ts = pd.Index([t[1] for t in tuples])
-
-    # Coerce timestamp to tz-naive datetime64[ns]
-    ts = pd.to_datetime(lvl_ts, errors="coerce", utc=False)
-
-    # If tz-aware slipped in, strip tz to make it naive
-    if getattr(ts.dtype, "tz", None) is not None:
-        # pandas Series with tz-aware dtype
-        ts = ts.tz_convert(None)
-
-    # Some pandas versions need .dt.tz_localize(None) instead:
-    # (guarded to avoid raising when tz is already None)
-    try:
-        if hasattr(ts.dt, "tz") and ts.dt.tz is not None:
-            ts = ts.dt.tz_localize(None)
-    except Exception:
-        pass
-
-    if ts.isna().any():
-        bad = int(ts.isna().sum())
-        raise ValueError(f"{bad} timestamp values could not be parsed to datetime64[ns].")
-
-    return pd.MultiIndex.from_arrays([pd.Index(lvl_item), pd.Index(ts)], names=["item_id", "timestamp"])
-
-
-import pandas as pd
-from autogluon.timeseries import TimeSeriesDataFrame
 
 
 def _flatten_tsdf(ts: "TimeSeriesDataFrame") -> pd.DataFrame:
     """
     Flatten a TimeSeriesDataFrame to a pandas.DataFrame with columns:
         ['item_id', 'timestamp', 'target', ...]
-    Robust to:
-      - Single-level DateTimeIndex
-      - MultiIndex with != 2 levels (uses first as item_id, last as timestamp)
-      - Existing 'item_id'/'timestamp' index level names (we drop the index before assigning columns)
     """
     df = pd.DataFrame(ts).copy()
+    idx = _ensure_two_level_index(df.index)
+    item_vals = idx.get_level_values(0).astype(str)
+    ts_vals = pd.to_datetime(idx.get_level_values(1), errors="coerce", utc=False)
 
-    # --- Extract index values before we drop the index
-    idx = df.index
-    nlevels = getattr(idx, "nlevels", 1)
-
-    if nlevels == 1:
-        # Single index: interpret as timestamp (coerce to datetime), synthesize item_id=0
-        ts_vals = idx
-        if not isinstance(ts_vals, pd.DatetimeIndex):
-            ts_vals = pd.to_datetime(ts_vals, errors="coerce", utc=False)
-        item_vals = pd.Series(0, index=df.index)
-    else:
-        # MultiIndex: first level -> item_id, last level -> timestamp
-        item_vals = idx.get_level_values(0)
-        ts_vals = idx.get_level_values(nlevels - 1)
-        ts_vals = pd.to_datetime(ts_vals, errors="coerce", utc=False)
-
-    # --- Drop the index entirely to avoid name collisions
     df.reset_index(drop=True, inplace=True)
-
-    # --- Assign canonical columns
-    df["item_id"] = item_vals.astype(str)  # string ids are robust
+    df["item_id"] = item_vals
     df["timestamp"] = ts_vals
-    if isinstance(df["timestamp"].dtype, pd.DatetimeTZDtype):  # older pandas compatibility
-        df["timestamp"] = df["timestamp"].dt.tz_convert(None)
 
-    # Ensure we have a 'target' column (AutoGluon standard)
     if "target" not in df.columns:
         for cand in ("y", "value", "request_cnt"):
             if cand in df.columns:
                 df = df.rename(columns={cand: "target"})
                 break
     if "target" not in df.columns:
-        raise ValueError("Expected a 'target' column in the data.")
+        num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if len(num_cols) == 1:
+            df = df.rename(columns={num_cols[0]: "target"})
+        else:
+            raise ValueError("Expected a 'target' column in the data.")
 
-    # Clean bad timestamps
     df = df.dropna(subset=["timestamp"])
-
-    # Order columns and sort
-    front = ["item_id", "timestamp"]
-    rest = [c for c in df.columns if c not in front]
-    df = df[front + rest].sort_values(["item_id", "timestamp"])
+    df = df.sort_values(["item_id", "timestamp"])
     return df
 
 
@@ -257,7 +311,7 @@ def _split_train_val_last_n(ts: "TimeSeriesDataFrame", holdout: int):
     Split last `holdout` points per series into validation.
     Returns (train_ts, val_ts) as TimeSeriesDataFrame objects.
     """
-    df = _flatten_tsdf(ts)  # columns: item_id, timestamp, target, ...
+    df = _flatten_tsdf(ts)
 
     train_rows, val_rows = [], []
     for _, g in df.groupby("item_id", sort=False):
@@ -270,22 +324,21 @@ def _split_train_val_last_n(ts: "TimeSeriesDataFrame", holdout: int):
     train_df = pd.concat(train_rows, axis=0) if train_rows else pd.DataFrame(columns=df.columns)
     val_df = pd.concat(val_rows, axis=0) if val_rows else pd.DataFrame(columns=df.columns)
 
-    def _to_tsdf(pdf: pd.DataFrame) -> "TimeSeriesDataFrame":
+    def _to_tsdf_back(pdf: pd.DataFrame) -> "TimeSeriesDataFrame":
         if pdf.empty:
             empty = (pd.DataFrame(columns=["item_id", "timestamp", "target"])
                      .set_index(["item_id", "timestamp"]))
             return TimeSeriesDataFrame(empty)
         pdf = pdf.copy()
         pdf["item_id"] = pdf["item_id"].astype(str)
-        pdf["timestamp"] = pd.to_datetime(pdf["timestamp"], errors="coerce", utc=False)
-        if isinstance(pdf["timestamp"].dtype, pd.DatetimeTZDtype):
-            pdf["timestamp"] = pdf["timestamp"].dt.tz_convert(None)
+        pdf["timestamp"] = _ensure_datetime(pdf["timestamp"])
         pdf = pdf.dropna(subset=["timestamp"])
         pdf = pdf.set_index(["item_id", "timestamp"]).sort_index()
+        pdf.index = _ensure_two_level_index(pdf.index)
         return TimeSeriesDataFrame(pdf)
 
-    train_ts = _to_tsdf(train_df)
-    val_ts = _to_tsdf(val_df)
+    train_ts = _to_tsdf_back(train_df)
+    val_ts = _to_tsdf_back(val_df)
     return train_ts, val_ts
 
 
@@ -293,7 +346,7 @@ def _synthesize_future_covariates(
         last_cov: pd.DataFrame,
         horizon: int,
         freq: str,
-) -> TimeSeriesDataFrame:
+) -> "TimeSeriesDataFrame":
     """
     Build a simple future covariates frame by carrying forward the last observed covariate values.
     last_cov: pandas DataFrame with MultiIndex [item_id, timestamp] and covariate columns.
@@ -301,27 +354,42 @@ def _synthesize_future_covariates(
     if last_cov.empty:
         return TimeSeriesDataFrame()
 
-    # Get the last timestamp per item
     last_cov = last_cov.copy()
-    last_cov.index = pd.MultiIndex.from_tuples(last_cov.index, names=["item_id", "timestamp"])
+    last_cov.index = _ensure_two_level_index(last_cov.index)
 
     future_parts = []
-    for item_id, g in last_cov.groupby(level=0):
+    for item_id, g in last_cov.groupby(level=0, sort=False):
         if g.empty:
             continue
         last_ts = g.index.get_level_values("timestamp").max()
         future_index = pd.date_range(last_ts, periods=horizon + 1, freq=freq, inclusive="neither")
-        # Carry forward last row's values
         last_vals = g.iloc[-1].to_frame().T
-        # Create repeated rows with future index
         repeat = pd.concat([last_vals] * len(future_index), ignore_index=True)
         repeat.index = pd.MultiIndex.from_product([[item_id], future_index], names=["item_id", "timestamp"])
         future_parts.append(repeat)
 
     fut = pd.concat(future_parts) if future_parts else pd.DataFrame()
     cov_future = TimeSeriesDataFrame(fut)
+    cov_future.index = _ensure_two_level_index(cov_future.index)
     cov_future = cov_future.groupby(level=0).apply(lambda g: g.ffill().bfill())
     return cov_future
+
+
+def _first_numeric_column(df: pd.DataFrame) -> str:
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            return c
+    raise ValueError("No numeric column found to use as forecast output.")
+
+
+def _ag_supports_known_covariates() -> bool:
+    """Return True if the installed AutoGluon exposes `known_covariates` in fit()/predict."""
+    try:
+        fit_sig = inspect.signature(TimeSeriesPredictor.fit)
+        pred_sig = inspect.signature(TimeSeriesPredictor.predict)
+        return ("known_covariates" in fit_sig.parameters) and ("known_covariates" in pred_sig.parameters)
+    except Exception:
+        return False
 
 
 # ---------------------------- Public API -------------------------------------
@@ -345,46 +413,6 @@ def run_autogluon_forecasting(
     """
     Train an AutoGluon TimeSeriesPredictor with optional known covariates and
     forecast the next horizon. Returns a JSON-friendly dict similar to other pipelines.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Input data with at least [ts_col, target] and optionally exog_cols and item_id_col.
-    target : str
-        Target column name (numeric).
-    ts_col : str
-        Timestamp column name (datetime-like or coercible).
-    exog_cols : list[str] or None
-        Known covariates (regressors). Can be empty/None.
-    horizon : int
-        Prediction length / forecast horizon.
-    time_limit : int
-        Seconds budget for AutoGluon.
-    hyperparameters : dict or None
-        Model set. Example: {"SeasonalNaive": {}, "AutoETS": {}, "NPTS": {}}
-    eval_metric : str
-        E.g. "MAPE", "MASE", "sMAPE", "RMSE".
-    verbosity : int
-        AutoGluon verbosity level.
-    freq : str
-        Pandas frequency string ("D", "W", "MS", ...).
-    item_id_col : str or None
-        Series identifier column. If None or missing, we create a single-series "series_0".
-    prediction_item_id : str
-        The id to use when we synthesize single-series inputs.
-    save_dir : str or None
-        If provided, predictor is saved to this directory.
-
-    Returns
-    -------
-    dict
-        {
-          "model_name": "autogluon",
-          "best_model": "<name>",
-          "leaderboard_key": "results/<dataset_id>_ag_leaderboard.json" (if you persist it),
-          "final_forecast": [{"ts": "...", "y_hat": float}, ...],
-          "ag_summary": {...},   # best model, metric
-        }
     """
     if not HAVE_AG:
         raise RuntimeError(
@@ -397,48 +425,62 @@ def run_autogluon_forecasting(
     # Ensure item_id existence
     df, item_id_col = _ensure_item_id(df, item_id_col)
     if df[item_id_col].nunique() == 1:
-        df[item_id_col] = prediction_item_id  # normalize single id name
+        df[item_id_col] = prediction_item_id
 
-    # --- Build target TSDF
+    # --- Build target TSDF (no fill on target)
     ts_target = _to_tsdf(
         df=df,
         item_id_col=item_id_col,
         ts_col=ts_col,
         value_cols=[target],
         freq=freq,
+        fill_na=False,
+        agg_numeric="mean",
     )
 
-    # --- Train/test split (holdout last=horizon for quick internal eval)
+    # --- Train/test split (holdout last=horizon)
     train_ts, test_ts = _split_train_val_last_n(ts_target, holdout=horizon)
 
-    # --- Known covariates (optional)
+    # --- Known covariates (optional; may be disabled by AG version)
     cov_train = None
     cov_test = None
     cov_future = None
+    covariates_supported = _ag_supports_known_covariates()
+    covariates_used = False
+
     if exog_cols:
-        # Full covariate TSDF (aligned & regularized)
-        ts_cov = _to_tsdf(
-            df=df,
-            item_id_col=item_id_col,
-            ts_col=ts_col,
-            value_cols=exog_cols,
-            freq=freq,
-        )
-        # Align to train/test windows
-        cov_train = ts_cov.reindex(train_ts.index).groupby(level=0).apply(lambda g: g.ffill().bfill())
+        if covariates_supported:
+            ts_cov = _to_tsdf(
+                df=df,
+                item_id_col=item_id_col,
+                ts_col=ts_col,
+                value_cols=exog_cols,
+                freq=freq,
+                fill_na=True,  # safe for covariates
+                agg_numeric="mean",
+            )
+            ts_cov.index = _ensure_two_level_index(ts_cov.index)
+            train_idx = _ensure_two_level_index(train_ts.index)
+            test_idx = _ensure_two_level_index(test_ts.index) if len(test_ts) > 0 else None
 
-        if len(test_ts) > 0:
-            cov_test = ts_cov.reindex(test_ts.index).groupby(level=0).apply(lambda g: g.ffill().bfill())
+            cov_train = ts_cov.reindex(train_idx).groupby(level=0).apply(lambda g: g.ffill().bfill())
+            if test_idx is not None and len(test_idx) > 0:
+                cov_test = ts_cov.reindex(test_idx).groupby(level=0).apply(lambda g: g.ffill().bfill())
 
-        # Also prepare simple future covariates for production (carry-forward last values)
-        cov_future = _synthesize_future_covariates(pd.DataFrame(ts_cov), horizon=horizon, freq=freq)
+            cov_future = _synthesize_future_covariates(pd.DataFrame(ts_cov), horizon=horizon, freq=freq)
+            covariates_used = True
+        else:
+            log.warning(
+                "AutoGluon version does not support known_covariates in fit/predict; "
+                "proceeding without exogenous regressors."
+            )
 
-    # --- Fit
+    # --- Fit AutoGluon
     hp = hyperparameters or {
         "SeasonalNaive": {},
         "AutoETS": {},
         "NPTS": {},
-        # Add lightweight DL models if desired:
+        # enable lightweight DL models if desired:
         # "PatchTST": {"epochs": 5},
         # "TiDE": {"epochs": 5},
         # "DeepAR": {"epochs": 5},
@@ -452,58 +494,109 @@ def run_autogluon_forecasting(
     )
 
     log.info("Fitting AutoGluon (time_limit=%s)", time_limit)
-    predictor.fit(
-        train_data=train_ts,
-        known_covariates=cov_train if cov_train is not None and not cov_train.empty else None,
-        known_covariates_names=exog_cols if exog_cols else None,
-        hyperparameters=hp,
-        time_limit=int(time_limit),
-    )
 
-    # --- Predict next horizon
-    # If we have a test split, predict on test; otherwise create a future frame from the last train point
-    if len(test_ts) > 0:
-        forecast_ts = predictor.predict(
-            data=test_ts,
-            known_covariates=cov_test if cov_test is not None and not cov_test.empty else None,
+    if covariates_used:
+        predictor.fit(
+            train_data=train_ts,
+            known_covariates=cov_train if cov_train is not None and not getattr(cov_train, "empty", False) else None,
+            known_covariates_names=exog_cols if exog_cols else None,
+            hyperparameters=hp,
+            time_limit=int(time_limit),
         )
     else:
-        # Build minimal future frame by slicing last horizon-length context (AG can project forward)
-        # Known covariates for future are passed if available
-        forecast_ts = predictor.predict(
-            data=train_ts,  # AG will forecast next horizon per series
-            known_covariates=cov_future if cov_future is not None and not cov_future.empty else None,
+        predictor.fit(
+            train_data=train_ts,
+            hyperparameters=hp,
+            time_limit=int(time_limit),
         )
 
-    # Serialize forecast to JSON-friendly list
-    # forecast_ts is a TSDF with target column named 'mean' or model-dependent; convert to pandas
-    fpdf = pd.DataFrame(forecast_ts)
-    fpdf.index = pd.MultiIndex.from_tuples(forecast_ts.index, names=["item_id", "timestamp"])
-    # Expect one (or many) series; if many, we return all
-    final_out: List[Dict] = []
-    for (item_id, ts), row in fpdf.sort_index().iterrows():
-        # Some models expose 'mean', others use the target name — choose first numeric
-        yhat = None
-        for c in fpdf.columns:
-            if pd.api.types.is_numeric_dtype(fpdf[c]):
-                yhat = float(row[c])
-                break
-        if yhat is None:
-            continue
-        final_out.append({"item_id": str(item_id), "ts": ts.isoformat(), "y_hat": yhat})
+    # --- Backtest over the held-out window (if any)
+    backtest = None
+    if len(test_ts) > 0:
+        if covariates_used:
+            test_fc = predictor.predict(
+                data=test_ts,
+                known_covariates=cov_test if cov_test is not None and not getattr(cov_test, "empty", False) else None,
+            )
+        else:
+            test_fc = predictor.predict(data=test_ts)
+
+        test_df = pd.DataFrame(test_ts).rename(columns={test_ts.columns[0]: "y"})
+        pred_df = pd.DataFrame(test_fc)
+
+        test_df.index = _ensure_two_level_index(test_df.index)
+        pred_df.index = _ensure_two_level_index(pred_df.index)
+
+        test_df = test_df.sort_index()
+        pred_df = pred_df.sort_index()
+
+        fcol = _first_numeric_column(pred_df)
+
+        y_true = test_df.iloc[:, 0].astype(float).values
+        y_hat = pred_df[fcol].astype(float).values
+
+        def _rmse(y, yhat):
+            return float(np.sqrt(np.mean((y - yhat) ** 2)))
+
+        def _smape(y, yhat, eps=1e-8):
+            y, yhat = np.asarray(y, float), np.asarray(yhat, float)
+            denom = (np.abs(y) + np.abs(yhat)) + eps
+            return float(np.mean(2.0 * np.abs(yhat - y) / denom))
+
+        def _mase(y, yhat, y_insample, m=7, eps=1e-8):
+            y_insample = np.asarray(y_insample, float)
+            d = np.abs(np.diff(y_insample, n=m)).mean() + eps
+            return float(np.mean(np.abs(np.asarray(y) - np.asarray(yhat))) / d)
+
+        insample_df = pd.DataFrame(train_ts)
+        insample_vals = insample_df.iloc[:, 0].astype(float).values
+
+        backtest = {
+            "metrics": {
+                "RMSE": _rmse(y_true, y_hat),
+                "sMAPE": _smape(y_true, y_hat),
+                "MASE": _mase(y_true, y_hat, insample_vals, m=7),
+            },
+            "preds": [{"ts": ts.isoformat(), "y_hat": float(v)} for (_, ts), v in pred_df[fcol].items()],
+            "trues": [{"ts": ts.isoformat(), "y": float(v)} for (_, ts), v in test_df.iloc[:, 0].items()],
+            "horizon": int(horizon),
+            "step": int(horizon),
+            "initial_train": int(len(insample_df) // max(1, train_ts.index.get_level_values(0).nunique())),
+        }
+
+    # --- Always produce a true future forecast for final_forecast ---
+    if covariates_used:
+        future_fc = predictor.predict(
+            data=train_ts,
+            known_covariates=cov_future if cov_future is not None and not getattr(cov_future, "empty", False) else None,
+        )
+    else:
+        future_fc = predictor.predict(data=train_ts)
+
+    fpdf = pd.DataFrame(future_fc)
+    fpdf.index = _ensure_two_level_index(fpdf.index)
+    fpdf = fpdf.sort_index()
+
+    fcol = _first_numeric_column(fpdf)
+
+    multi_series = df[item_id_col].nunique() > 1
+    if not multi_series:
+        final_out = [{"ts": ts.isoformat(), "y_hat": float(val)}
+                     for (_, ts), val in fpdf[fcol].items()]
+    else:
+        final_out = [{"item_id": str(item), "ts": ts.isoformat(), "y_hat": float(val)}
+                     for (item, ts), val in fpdf[fcol].items()]
 
     # Optional save
     if save_dir:
         try:
-            predictor.save(save_dir)  # AG 1.1.0+ returns the path; older versions ignore the arg
+            predictor.save(save_dir)
         except TypeError:
-            # Older AG expects no argument to save; ignore save_dir or use predictor.save()
             predictor.save()
 
-    # Leaderboard (best model) — not persisted here, but summarized
+    # Leaderboard (best model) — summarized only
     try:
         lb = predictor.leaderboard(silent=True)
-        # get best row
         best_row = lb.iloc[0].to_dict() if len(lb) else {}
     except Exception:
         best_row = {}
@@ -515,8 +608,14 @@ def run_autogluon_forecasting(
         "final_forecast": final_out,
         "ag_summary": {
             "eval_metric": eval_metric,
-            "time_limit": time_limit,
-            "hyperparameters": hp,
+            "time_limit": int(time_limit),
+            "hyperparameters": hyperparameters or {"SeasonalNaive": {}, "AutoETS": {}, "NPTS": {}},
+            "multi_series": bool(multi_series),
+            "covariates_supported": bool(covariates_supported),
+            "covariates_used": bool(covariates_used),
         },
     }
+    if backtest is not None:
+        out["backtest"] = backtest
+
     return out

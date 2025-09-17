@@ -48,6 +48,40 @@ class AGConfig:
 
 # ---------------------------- Helpers ----------------------------------------
 
+def _ensure_tsdf_target_name(ts: "TimeSeriesDataFrame", orig_target_name: str) -> "TimeSeriesDataFrame":
+    """
+    Ensure the TimeSeriesDataFrame has a single numeric column named 'target'.
+    If it currently uses the original CSV column name (e.g., 'request_cnt'),
+    rename it to 'target'.
+    """
+    pdf = pd.DataFrame(ts).copy()
+
+    # If already correct
+    if list(pdf.columns) == ["target"]:
+        return TimeSeriesDataFrame(pdf)
+
+    # If the original target name exists, rename that
+    if orig_target_name in pdf.columns:
+        pdf = pdf.rename(columns={orig_target_name: "target"})
+        return TimeSeriesDataFrame(pdf)
+
+    # If there's exactly one column, rename it to 'target'
+    num_cols = [c for c in pdf.columns if pd.api.types.is_numeric_dtype(pdf[c])]
+    if len(pdf.columns) == 1:
+        pdf = pdf.rename(columns={pdf.columns[0]: "target"})
+        return TimeSeriesDataFrame(pdf)
+
+    # As a fallback, if there is exactly one numeric column, use it
+    if len(num_cols) == 1:
+        pdf = pdf.rename(columns={num_cols[0]: "target"})
+        return TimeSeriesDataFrame(pdf)
+
+    raise ValueError(
+        f"Could not identify the target column to rename to 'target'. "
+        f"Columns present: {list(pdf.columns)} (expected '{orig_target_name}' or a single numeric column)."
+    )
+
+
 def _ensure_datetime(series: pd.Series) -> pd.Series:
     """Coerce a column to datetime (raise if totally invalid)."""
     s = pd.to_datetime(series, errors="raise", utc=False)
@@ -438,6 +472,9 @@ def run_autogluon_forecasting(
         agg_numeric="mean",
     )
 
+    # Ensure target column is named 'target'
+    ts_target = _ensure_tsdf_target_name(ts_target, orig_target_name=target)
+
     # --- Train/test split (holdout last=horizon)
     train_ts, test_ts = _split_train_val_last_n(ts_target, holdout=horizon)
 
@@ -513,43 +550,55 @@ def run_autogluon_forecasting(
     # --- Backtest over the held-out window (if any)
     backtest = None
     if len(test_ts) > 0:
+        # IMPORTANT:
+        # Predict the *validation window* (next horizon after train end),
+        # so we must pass data=train_ts here (NOT test_ts).
         if covariates_used:
+            # cov_test is indexed on the validation window timestamps -> correct for future steps
             test_fc = predictor.predict(
-                data=test_ts,
+                data=train_ts,
                 known_covariates=cov_test if cov_test is not None and not getattr(cov_test, "empty", False) else None,
             )
         else:
-            test_fc = predictor.predict(data=test_ts)
+            test_fc = predictor.predict(data=train_ts)
 
+        # Align predictions to the true validation window and compute metrics
         test_df = pd.DataFrame(test_ts).rename(columns={test_ts.columns[0]: "y"})
         pred_df = pd.DataFrame(test_fc)
 
         test_df.index = _ensure_two_level_index(test_df.index)
         pred_df.index = _ensure_two_level_index(pred_df.index)
 
-        test_df = test_df.sort_index()
-        pred_df = pred_df.sort_index()
+        # Inner-join on the common validation timestamps to avoid NaNs
+        both = (
+            pred_df.join(test_df[["y"]], how="inner")
+            .sort_index()
+        )
+        fcol = _first_numeric_column(both)
 
-        fcol = _first_numeric_column(pred_df)
+        # Drop any remaining NaNs for fair metric calculation
+        both = both[np.isfinite(both[fcol]) & np.isfinite(both["y"])]
 
-        y_true = test_df.iloc[:, 0].astype(float).values
-        y_hat = pred_df[fcol].astype(float).values
+        y_true = both["y"].astype(float).values
+        y_hat = both[fcol].astype(float).values
 
         def _rmse(y, yhat):
-            return float(np.sqrt(np.mean((y - yhat) ** 2)))
+            return float(np.sqrt(np.mean((y - yhat) ** 2))) if len(y) else None
 
         def _smape(y, yhat, eps=1e-8):
+            if not len(y): return None
             y, yhat = np.asarray(y, float), np.asarray(yhat, float)
             denom = (np.abs(y) + np.abs(yhat)) + eps
             return float(np.mean(2.0 * np.abs(yhat - y) / denom))
 
         def _mase(y, yhat, y_insample, m=7, eps=1e-8):
+            if not len(y): return None
             y_insample = np.asarray(y_insample, float)
             d = np.abs(np.diff(y_insample, n=m)).mean() + eps
             return float(np.mean(np.abs(np.asarray(y) - np.asarray(yhat))) / d)
 
         insample_df = pd.DataFrame(train_ts)
-        insample_vals = insample_df.iloc[:, 0].astype(float).values
+        insample_vals = insample_df.iloc[:, 0].astype(float).values if len(insample_df) else np.array([])
 
         backtest = {
             "metrics": {
@@ -557,21 +606,21 @@ def run_autogluon_forecasting(
                 "sMAPE": _smape(y_true, y_hat),
                 "MASE": _mase(y_true, y_hat, insample_vals, m=7),
             },
-            "preds": [{"ts": ts.isoformat(), "y_hat": float(v)} for (_, ts), v in pred_df[fcol].items()],
-            "trues": [{"ts": ts.isoformat(), "y": float(v)} for (_, ts), v in test_df.iloc[:, 0].items()],
+            "preds": [{"ts": ts.isoformat(), "y_hat": float(v)} for (item, ts), v in both[fcol].items()],
+            "trues": [{"ts": ts.isoformat(), "y": float(v)} for (item, ts), v in both["y"].items()],
             "horizon": int(horizon),
             "step": int(horizon),
             "initial_train": int(len(insample_df) // max(1, train_ts.index.get_level_values(0).nunique())),
         }
 
-    # --- Always produce a true future forecast for final_forecast ---
+    # --- True future forecast (after the end of the full series) ---
     if covariates_used:
         future_fc = predictor.predict(
-            data=train_ts,
+            data=ts_target,  # NOTE: use the full series here
             known_covariates=cov_future if cov_future is not None and not getattr(cov_future, "empty", False) else None,
         )
     else:
-        future_fc = predictor.predict(data=train_ts)
+        future_fc = predictor.predict(data=ts_target)
 
     fpdf = pd.DataFrame(future_fc)
     fpdf.index = _ensure_two_level_index(fpdf.index)
